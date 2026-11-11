@@ -1,0 +1,44 @@
+name: Publish signature delta
+
+on:
+  schedule:
+    - cron: "17 3 * * *"      # chaque jour a 03:17 UTC
+  workflow_dispatch:           # lancement manuel (bouton "Run workflow")
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-delta
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Build delta
+        env:
+          ABUSECH_KEY: ${{ secrets.ABUSECH_KEY }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python publish_delta.py --out out
+
+      - name: Publish to release "latest"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --latest=false \
+              --title "Latest delta" \
+              --notes "Mises a jour quotidiennes des signatures (automatique)."
+          gh release upload latest out/delta.csv.gz out/manifest.json --clobber
