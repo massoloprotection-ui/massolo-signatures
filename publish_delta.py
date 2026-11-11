@@ -187,6 +187,42 @@ def parse_export(raw: bytes) -> dict:
     return rows
 
 
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?")
+_TOKEN_RE = re.compile(r"[0-9a-fA-F]{32,64}")
+
+
+def parse_loose(raw: bytes) -> dict:
+    """Secours si le format change : cherche sur chaque ligne un sha256 (64 hex),
+    et si presents un md5 (32), un sha1 (40) et une date. Pas de nom ni de famille."""
+    if zipfile.is_zipfile(io.BytesIO(raw)):
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        raw = z.read(z.namelist()[0])
+    text = raw.decode("utf-8", errors="ignore")
+    rows = {}
+    for ln in text.splitlines():
+        if ln.startswith("#"):
+            continue
+        toks = {len(t): t.lower() for t in _TOKEN_RE.findall(ln) if len(t) in (32, 40, 64)}
+        sha256 = toks.get(64, "")
+        if not SHA256_RE.match(sha256):
+            continue
+        m = _DATE_RE.search(ln)
+        first_seen = m.group(0).replace("T", " ") if m else ""
+        rows[sha256] = [first_seen, sha256, toks.get(32, ""), toks.get(40, ""),
+                        "", "", "Hash suspect non classifié (MalwareBazaar)"]
+    return rows
+
+
+def describe_raw(raw: bytes, key: str) -> str:
+    """Apercu SANS la cle, pour diagnostiquer un format inattendu."""
+    kind = "zip" if zipfile.is_zipfile(io.BytesIO(raw)) else "texte"
+    if kind == "zip":
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        raw = z.read(z.namelist()[0])
+    head = raw[:400].decode("utf-8", errors="replace").replace(key, "***")
+    return f"{kind}, {len(raw):,} octets ; debut : {head!r}"
+
+
 def load_previous(path_or_url: str) -> dict:
     """Delta precedent (fichier local ou URL). 404 / absent -> vide."""
     try:
@@ -268,14 +304,28 @@ def main():
         key = os.environ.get("ABUSECH_KEY", "").strip()
         if not key:
             sys.exit("ERREUR : secret ABUSECH_KEY absent")
+        new = {}
         try:
-            new = parse_export(fetch_export(key))
+            raw = fetch_export(key)
+            new = parse_export(raw)
+            if len(new) < MIN_NEW_ROWS:
+                print("AVERTISSEMENT : lecture structuree insuffisante "
+                      f"({len(new)} lignes). Apercu de la reponse : {describe_raw(raw, key)}")
+                loose_rows = parse_loose(raw)
+                print(f"lecture tolerante : {len(loose_rows):,} hashes")
+                if len(loose_rows) > len(new):
+                    new = loose_rows
         except Exception as e:
-            print(f"AVERTISSEMENT : export indisponible ({e}), repli sur l'API get_recent (mode degrade)")
+            print(f"AVERTISSEMENT : export indisponible ({e})")
+        if len(new) < MIN_NEW_ROWS:
+            print("repli sur l'API get_recent (mode degrade)")
             try:
-                new = fetch_api_recent(key)
+                api_rows = fetch_api_recent(key)
+                print(f"API : {len(api_rows):,} hashes")
+                if len(api_rows) > len(new):
+                    new = api_rows
             except Exception as e2:
-                sys.exit(f"ERREUR : export ({e}) et API ({e2}) indisponibles, rien publie")
+                print(f"AVERTISSEMENT : API indisponible ({e2})")
 
     print(f"export : {len(new):,} hashes valides")
     if not (MIN_NEW_ROWS <= len(new) <= MAX_NEW_ROWS):
