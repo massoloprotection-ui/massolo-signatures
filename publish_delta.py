@@ -3,8 +3,9 @@
 """Massolo - publication quotidienne du delta de signatures.
 
 Tourne dans GitHub Actions (voir publish-delta.yml), JAMAIS chez les clients.
-Lit l'export "recent" de MalwareBazaar avec la cle ABUSECH_KEY (secret du depot),
-le fusionne avec le delta precedemment publie (fenetre glissante de 14 jours),
+Lit l'export "recent" de MalwareBazaar (48 dernieres heures) avec la cle ABUSECH_KEY
+(secret du depot), ou, s'il est indisponible, l'API get_recent (mode degrade),
+le fusionne avec le delta precedemment publie (fenetre glissante de 7 jours),
 puis ecrit :
   out/delta.csv.gz   les nouveaux hashes (sha256 valides uniquement)
   out/manifest.json  version, SHA-256 du .gz, signature Ed25519 (si SIGNING_KEY)
@@ -29,8 +30,11 @@ import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
 
-EXPORT_URL = "https://bazaar.abuse.ch/export/csv/recent/"
-WINDOW_DAYS = 14
+# Nouvelle adresse documentee par abuse.ch (l'ancienne /export/csv/... repond 410 Gone).
+# La cle fait partie de l'URL : ne jamais l'afficher dans les logs.
+EXPORT_URL = "https://mb-api.abuse.ch/v2/files/exports/{key}/recent.csv"
+API_URL = "https://mb-api.abuse.ch/api/v1/"
+WINDOW_DAYS = 7
 MIN_NEW_ROWS = 50          # en dessous : flux vide ou en panne, on ne publie pas
 MAX_NEW_ROWS = 500_000     # au dessus : flux anormal, on ne publie pas
 MAX_DOWNLOAD = 300 * 1024 * 1024
@@ -41,17 +45,70 @@ UA = "Massolo-Signatures-Publisher/1.0"
 
 
 def fetch_export(key: str) -> bytes:
-    req = urllib.request.Request(EXPORT_URL, headers={"Auth-Key": key, "User-Agent": UA})
+    req = urllib.request.Request(EXPORT_URL.format(key=key), headers={"User-Agent": UA})
     buf = bytearray()
-    with urllib.request.urlopen(req, timeout=120) as r:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            buf += chunk
-            if len(buf) > MAX_DOWNLOAD:
-                raise RuntimeError("export trop volumineux")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_DOWNLOAD:
+                    raise RuntimeError("export trop volumineux")
+    except urllib.error.HTTPError as e:
+        # on n'affiche jamais l'URL : elle contient la cle
+        raise RuntimeError(f"HTTP {e.code} {e.reason}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"connexion impossible ({e.reason})") from None
     return bytes(buf)
+
+
+def _api_post(key: str, selector: str) -> list:
+    data = f"query=get_recent&selector={selector}".encode("ascii")
+    req = urllib.request.Request(
+        API_URL, data=data, method="POST",
+        headers={"Auth-Key": key, "User-Agent": UA,
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read(50 * 1024 * 1024).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"API HTTP {e.code} {e.reason}") from None
+    status = result.get("query_status")
+    if status == "no_results":
+        return []
+    if status != "ok":
+        raise RuntimeError(f"API query_status={status}")
+    return result.get("data", [])
+
+
+def rows_from_api(items: list) -> dict:
+    rows = {}
+    for it in items:
+        sha256 = str(it.get("sha256_hash", "")).strip().lower()
+        if not SHA256_RE.match(sha256):
+            continue
+        sig = str(it.get("signature") or "").strip()
+        if not sig or sig.lower() in ("n/a", "na", "-"):
+            sig = "Hash suspect non classifié (MalwareBazaar)"
+        rows[sha256] = [
+            str(it.get("first_seen", "")).strip(), sha256,
+            _clean_hex(str(it.get("md5_hash", "")), 32),
+            _clean_hex(str(it.get("sha1_hash", "")), 40),
+            str(it.get("file_name") or "").strip(),
+            str(it.get("file_type") or "").strip(), sig,
+        ]
+    return rows
+
+
+def fetch_api_recent(key: str) -> dict:
+    """Mode degrade : get_recent 'time' (60 min) + '100' (100 derniers). Documente
+    par abuse.ch : seuls ces deux selecteurs existent."""
+    items = []
+    for selector in ("time", "100"):
+        items += _api_post(key, selector)
+    return rows_from_api(items)
 
 
 def _clean_hex(value: str, length: int) -> str:
@@ -59,30 +116,74 @@ def _clean_hex(value: str, length: int) -> str:
     return value if HEX_RE[length].match(value) else ""
 
 
+# Noms de colonnes (export abuse.ch) -> champ interne. Les positions par defaut
+# servent seulement si aucun en-tete n'est trouve.
+_NAMES = {
+    "first_seen": ("first_seen_utc", "first_seen"),
+    "sha256": ("sha256_hash", "sha256"),
+    "md5": ("md5_hash", "md5"),
+    "sha1": ("sha1_hash", "sha1"),
+    "file_name": ("file_name",),
+    "file_type": ("file_type_guess", "file_type"),
+    "signature": ("signature",),
+}
+_DEFAULT_POS = {"first_seen": 0, "sha256": 1, "md5": 2, "sha1": 3,
+                "file_name": 5, "file_type": 6, "signature": 8}
+
+
+def _columns(header: list) -> dict:
+    names = [h.strip().strip('"').lower() for h in header]
+    pos = {}
+    for field, aliases in _NAMES.items():
+        for a in aliases:
+            if a in names:
+                pos[field] = names.index(a)
+                break
+    return pos if "sha256" in pos else dict(_DEFAULT_POS)
+
+
 def parse_export(raw: bytes) -> dict:
-    """Export MalwareBazaar (zip ou CSV brut) -> {sha256: ligne}."""
+    """Export MalwareBazaar (zip ou CSV brut) -> {sha256: ligne}. Les colonnes sont
+    retrouvees par leur nom dans l'en-tete (commente ou non)."""
     if zipfile.is_zipfile(io.BytesIO(raw)):
         z = zipfile.ZipFile(io.BytesIO(raw))
         raw = z.read(z.namelist()[0])
     text = raw.decode("utf-8", errors="ignore")
-    lines = (ln for ln in text.splitlines() if ln and not ln.startswith("#"))
+    pos = dict(_DEFAULT_POS)
+    data_lines = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        if ln.startswith("#"):
+            if "sha256" in ln.lower():
+                header = next(csv.reader([ln.lstrip("# ").strip()]), [])
+                pos = _columns(header)
+            continue
+        data_lines.append(ln)
     rows = {}
-    for parts in csv.reader(lines):
-        if not parts or parts[0].strip().lower().startswith("first_seen"):
+    for parts in csv.reader(data_lines):
+        if not parts:
             continue
-        if len(parts) < 9:
+        if parts[0].strip().lower().startswith("first_seen") or "sha256" in parts[0].lower():
+            pos = _columns(parts)          # en-tete non commente
             continue
-        sha256 = parts[1].strip().lower()
+        need = max(pos.values())
+        if len(parts) <= need:
+            continue
+
+        def col(field):
+            i = pos.get(field)
+            return parts[i].strip() if i is not None and i < len(parts) else ""
+
+        sha256 = col("sha256").lower()
         if not SHA256_RE.match(sha256):
             continue
-        sig = parts[8].strip()
+        sig = col("signature")
         if not sig or sig.lower() in ("n/a", "na", "-"):
             sig = "Hash suspect non classifié (MalwareBazaar)"
-        rows[sha256] = [
-            parts[0].strip(), sha256,
-            _clean_hex(parts[2], 32), _clean_hex(parts[3], 40),
-            parts[5].strip(), parts[6].strip(), sig,
-        ]
+        rows[sha256] = [col("first_seen"), sha256,
+                        _clean_hex(col("md5"), 32), _clean_hex(col("sha1"), 40),
+                        col("file_name"), col("file_type"), sig]
     return rows
 
 
@@ -162,14 +263,20 @@ def main():
     previous = a.previous or (base + "delta.csv.gz")
 
     if a.export_file:
-        raw = open(a.export_file, "rb").read()
+        new = parse_export(open(a.export_file, "rb").read())
     else:
         key = os.environ.get("ABUSECH_KEY", "").strip()
         if not key:
             sys.exit("ERREUR : secret ABUSECH_KEY absent")
-        raw = fetch_export(key)
+        try:
+            new = parse_export(fetch_export(key))
+        except Exception as e:
+            print(f"AVERTISSEMENT : export indisponible ({e}), repli sur l'API get_recent (mode degrade)")
+            try:
+                new = fetch_api_recent(key)
+            except Exception as e2:
+                sys.exit(f"ERREUR : export ({e}) et API ({e2}) indisponibles, rien publie")
 
-    new = parse_export(raw)
     print(f"export : {len(new):,} hashes valides")
     if not (MIN_NEW_ROWS <= len(new) <= MAX_NEW_ROWS):
         sys.exit(f"ERREUR : {len(new):,} lignes hors de [{MIN_NEW_ROWS}, {MAX_NEW_ROWS}], rien publie")
